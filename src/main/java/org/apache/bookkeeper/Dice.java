@@ -3,25 +3,27 @@ package org.apache.bookkeeper;
 
 import com.fishjam.util.debug.DebugUtil;
 import com.google.common.primitives.Ints;
-
-import java.io.Closeable;
-import java.nio.ByteBuffer;
-import java.util.*;
-
-import org.apache.bookkeeper.conf.ClientConfiguration;
+import org.apache.bookkeeper.client.BKException;
 import org.apache.bookkeeper.client.BookKeeper;
 import org.apache.bookkeeper.client.LedgerEntry;
 import org.apache.bookkeeper.client.LedgerHandle;
-import org.apache.bookkeeper.client.BKException;
+import org.apache.bookkeeper.conf.ClientConfiguration;
 import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.framework.CuratorFrameworkFactory;
-import org.apache.curator.framework.recipes.leader.LeaderSelector;
-import org.apache.curator.framework.recipes.leader.LeaderSelectorListenerAdapter;
+import org.apache.curator.framework.recipes.leader.*;
 import org.apache.curator.retry.ExponentialBackoffRetry;
 import org.apache.zookeeper.KeeperException;
 
+import java.io.Closeable;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Enumeration;
+import java.util.List;
 
-public class Dice extends LeaderSelectorListenerAdapter implements Closeable {
+
+public class Dice extends LeaderSelectorListenerAdapter implements Closeable, LeaderLatchListener {
 
   final static String ZOOKEEPER_SERVER = "127.0.0.1:2181";
   final static String ELECTION_PATH = "/dice-elect";
@@ -31,7 +33,8 @@ public class Dice extends LeaderSelectorListenerAdapter implements Closeable {
   //Random r = new Random();
   int globalNextInt = 0;
   CuratorFramework curator;
-  LeaderSelector leaderSelector;
+  //LeaderSelector leaderSelector;
+  LeaderLatch leaderLatch;
   BookKeeper bookkeeper;
 
   volatile boolean leader = false;
@@ -43,9 +46,19 @@ public class Dice extends LeaderSelectorListenerAdapter implements Closeable {
     curator.start();
     curator.blockUntilConnected();
 
-    leaderSelector = new LeaderSelector(curator, ELECTION_PATH, this);
-    leaderSelector.autoRequeue();
-    leaderSelector.start();
+    DebugUtil.log("begin LeaderSelector");
+    //leaderSelector = new LeaderSelector(curator, ELECTION_PATH, this);
+    //leaderSelector.autoRequeue();
+    //leaderSelector.start();
+
+    leaderLatch = new LeaderLatch(curator, ELECTION_PATH);
+    leaderLatch.addListener(this);
+    leaderLatch.start();
+
+    DebugUtil.log("before getLeader");
+    //Participant leader = leaderSelector.getLeader();
+    Participant leader = leaderLatch.getLeader();
+    DebugUtil.log("after select start, leader is:" + this.leader);
 
     ClientConfiguration conf = new ClientConfiguration()
         .setZkServers(ZOOKEEPER_SERVER).setZkTimeout(30000);
@@ -56,7 +69,8 @@ public class Dice extends LeaderSelectorListenerAdapter implements Closeable {
   public void takeLeadership(CuratorFramework client)
       throws Exception {
     synchronized (this) {
-      DebugUtil.log(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>Becoming leader");
+      //DebugUtil.log(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>Becoming leader(%s)", leaderSelector.getLeader());
+      //Thread.sleep(3000); //测试选举会话费时间的情况
       leader = true;
       try {
         while (true) {
@@ -66,15 +80,40 @@ public class Dice extends LeaderSelectorListenerAdapter implements Closeable {
         Thread.currentThread().interrupt();
         leader = false;
         ie.printStackTrace();
+        //DebugUtil.log(ie.toString());
       }
       DebugUtil.log("<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<Losing leader");
     }
   }
 
   @Override
+  public void isLeader() {
+    leader = true;
+    try {
+      DebugUtil.log(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>> isLeader: %s", leaderLatch.getLeader());
+    } catch (Exception e) {
+      e.printStackTrace();
+    }
+  }
+
+  @Override
+  public void notLeader() {
+    leader = false;
+    try {
+      DebugUtil.log("<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<< notLeader: %s", leaderLatch.getLeader());
+    } catch (Exception e) {
+      e.printStackTrace();
+    }
+  }
+  @Override
   public void close() {
     DebugUtil.log("Enter close, this is never execute");
-    leaderSelector.close();
+    //leaderSelector.close();
+    try {
+      leaderLatch.close();
+    } catch (IOException e) {
+      e.printStackTrace();
+    }
     curator.close();
   }
 
@@ -112,12 +151,14 @@ public class Dice extends LeaderSelectorListenerAdapter implements Closeable {
         lh = bookkeeper.openLedger(previous,
             BookKeeper.DigestType.MAC, DICE_PASSWD);
       } catch (BKException.BKLedgerRecoveryException e) {
+        //DebugUtil.log(e.toString());
         e.printStackTrace();
         return lastDisplayedEntry;
       }
 
       if (nextEntry > lh.getLastAddConfirmed()) {
-        DebugUtil.log("leader, nextEntry(%d) > lh.getLastAddConfirmed(%d)", nextEntry, lh.getLastAddConfirmed());
+        DebugUtil.log("Warn: leader, nextEntry(%d) Bigger than lh.getLastAddConfirmed(%d), skipPast=%s, ledgerId=%d",
+            nextEntry, lh.getLastAddConfirmed(), skipPast, lh.getId());
         nextEntry = 0;
         continue;
       }
@@ -145,6 +186,7 @@ public class Dice extends LeaderSelectorListenerAdapter implements Closeable {
         curator.create().forPath(DICE_LOG, ledgerListBytes);
       } catch (KeeperException.NodeExistsException nne) {
         nne.printStackTrace();
+        //DebugUtil.log(nne.toString());
         return lastDisplayedEntry;
       }
     } else {
@@ -155,6 +197,7 @@ public class Dice extends LeaderSelectorListenerAdapter implements Closeable {
             .forPath(DICE_LOG, ledgerListBytes);
       } catch (KeeperException.BadVersionException bve) {
         bve.printStackTrace();
+        //DebugUtil.log(bve.toString());
         return lastDisplayedEntry;
       }
     }
@@ -162,18 +205,24 @@ public class Dice extends LeaderSelectorListenerAdapter implements Closeable {
     try {
       while (leader) {
         //int nextInt = r.nextInt(6) + 1;
-        globalNextInt++;
         long entryId = lh.addEntry(Ints.toByteArray(globalNextInt));
         DebugUtil.log("Value = " + globalNextInt
             + ", epoch = " + lh.getId()
             + ", leading");
+        globalNextInt++;
+
         lastDisplayedEntry = new EntryId(lh.getId(), entryId);
         Thread.sleep(5000);
       }
+      DebugUtil.log(">>>>>>>> lost leader, now will close ledger,id=%d, lastAddCfm=%d",
+          lh.getId(), lh.getLastAddConfirmed());
       lh.close();
     } catch (BKException e) {
+      //Ctrl+Z 放后台再重新放到前台, addEntry 时可能发生 BKException$BKLedgerFencedException 异常?
+
       // let it fall through to the return
       e.printStackTrace();
+      //DebugUtil.log(e.toString());
     }
     return lastDisplayedEntry;
   }
@@ -182,6 +231,7 @@ public class Dice extends LeaderSelectorListenerAdapter implements Closeable {
     DebugUtil.log("Enter follow................");
     List<Long> ledgers = null;
     while (ledgers == null) {
+      //等待leader创建meta信息的节点 -- 在几个节点同时启动时出现
       try {
         byte[] ledgerListBytes = curator.getData()
             .forPath(DICE_LOG);
@@ -193,33 +243,47 @@ public class Dice extends LeaderSelectorListenerAdapter implements Closeable {
       } catch (KeeperException.NoNodeException nne) {
         Thread.sleep(1000);
         nne.printStackTrace();
+        //DebugUtil.log(nne.toString());
       }
     }
+    DebugUtil.log("follow: ledgers:=%s, skipPast=%s", Arrays.toString(ledgers.toArray()), skipPast);
 
     EntryId lastReadEntry = skipPast;
     while (!leader) {
       for (long previous : ledgers) {
         boolean isClosed = false;
         long nextEntry = 0;
+        String strLastDiffInfo = "";
         while (!isClosed && !leader) {
+          //轮询机制 -- 只要 ledger 没有关闭,就依此获取其最新值
           if (lastReadEntry.getLedgerId() == previous) {
             nextEntry = lastReadEntry.getEntryId() + 1;
           }
           isClosed = bookkeeper.isClosed(previous);
-          LedgerHandle lh = bookkeeper.openLedgerNoRecovery(previous,
+          LedgerHandle lh = bookkeeper.openLedgerNoRecovery(previous, //TODO:尝试改为 openLedger 后查看效果
               BookKeeper.DigestType.MAC, DICE_PASSWD);
 
-          String strInfo = String.format("LedgerId=%d,confirmed=%d,addpushed=%d,length=%d",
-              lh.getId(), lh.getLastAddConfirmed(), lh.getLastAddPushed(), lh.getLength());
-          DebugUtil.log(strInfo);
+          String strInfo = String.format("follow: LedgerId=%d, isClosed=%d, tryLastConfirm=%d, confirmed=%d"
+                  + ",addpushed=%d,length=%d, nextEntry=%d",
+              lh.getId(), isClosed? 1 : 0,
+              lh.tryReadLastConfirmed(), lh.getLastAddConfirmed(),
+              lh.getLastAddPushed(), lh.getLength(), nextEntry);
+
+          if (strLastDiffInfo != strInfo) {
+            //避免打印重复数据太多 -- 当前5秒写一次,1秒尝试读取一次
+            DebugUtil.log(strInfo);
+            //strLastDiffInfo = strInfo;
+          }
+
           if (nextEntry <= lh.getLastAddConfirmed()) {
+            //表明写入了新的值
             Enumeration<LedgerEntry> entries
                 = lh.readEntries(nextEntry,
                 lh.getLastAddConfirmed());
             while (entries.hasMoreElements()) {
               LedgerEntry e = entries.nextElement();
               byte[] entryData = e.getEntry();
-              DebugUtil.log("Value = " + Ints.fromByteArray(entryData)
+              DebugUtil.log("Read new value = " + Ints.fromByteArray(entryData)
                   + ", epoch = " + lh.getId()
                   + ", following");
               lastReadEntry = new EntryId(previous, e.getEntryId());
@@ -234,6 +298,8 @@ public class Dice extends LeaderSelectorListenerAdapter implements Closeable {
       byte[] ledgerListBytes = curator.getData()
           .forPath(DICE_LOG);
       ledgers = listFromBytes(ledgerListBytes);
+      DebugUtil.log("get new ledgers:%s, lastReadEntry=%s", Arrays.toString(ledgers.toArray()), lastReadEntry);
+
       ledgers = ledgers.subList(ledgers.indexOf(lastReadEntry.getLedgerId()) + 1, ledgers.size());
     }
     return lastReadEntry;
