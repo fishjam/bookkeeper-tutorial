@@ -46,6 +46,13 @@ public class Dice extends LeaderSelectorListenerAdapter implements Closeable, Le
     curator.start();
     curator.blockUntilConnected();
 
+    try {
+      curator.create().forPath(ELECTION_PATH);
+    }catch(KeeperException.NodeExistsException e){
+      System.out.println("ELECTION_PATH exist, just ignore");
+    }
+
+
     DebugUtil.log("begin LeaderSelector");
     //leaderSelector = new LeaderSelector(curator, ELECTION_PATH, this);
     //leaderSelector.autoRequeue();
@@ -263,11 +270,11 @@ public class Dice extends LeaderSelectorListenerAdapter implements Closeable, Le
           LedgerHandle lh = bookkeeper.openLedgerNoRecovery(previous, //TODO:尝试改为 openLedger 后查看效果
               BookKeeper.DigestType.MAC, DICE_PASSWD);
 
-          String strInfo = String.format("follow: LedgerId=%d, isClosed=%d, tryLastConfirm=%d, confirmed=%d"
-                  + ",addpushed=%d,length=%d, nextEntry=%d",
-              lh.getId(), isClosed? 1 : 0,
+          String strInfo = String.format("follow: LedgerId=%d, previous=%d, isClosed=%d, tryLastConfirm=%d, confirmed=%d"
+                  + ",addpushed=%d,length=%d, nextEntry=%d, lastReadEntry=%s",
+              lh.getId(), previous, isClosed? 1 : 0,
               lh.tryReadLastConfirmed(), lh.getLastAddConfirmed(),
-              lh.getLastAddPushed(), lh.getLength(), nextEntry);
+              lh.getLastAddPushed(), lh.getLength(), nextEntry, lastReadEntry);
 
           if (strLastDiffInfo != strInfo) {
             //避免打印重复数据太多 -- 当前5秒写一次,1秒尝试读取一次
